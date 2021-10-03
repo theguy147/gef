@@ -79,6 +79,7 @@ import time
 import traceback
 import configparser
 import xmlrpc.client as xmlrpclib
+import warnings
 
 from functools import lru_cache
 from io import StringIO
@@ -1314,7 +1315,8 @@ def show_last_exception():
 
     def _show_code_line(fname, idx):
         fname = os.path.expanduser(os.path.expandvars(fname))
-        __data = open(fname, "r").read().splitlines()
+        with open(fname, "r") as f:
+            __data = f.readlines()
         return __data[idx - 1] if idx < len(__data) else ""
 
     gef_print("")
@@ -2758,16 +2760,22 @@ def read_int_from_memory(addr):
 def read_cstring_from_memory(address, max_length=GEF_MAX_STRING_LENGTH, encoding=None):
     """Return a C-string read from memory."""
 
-    if not encoding:
-        encoding = "unicode_escape"
+    encoding = encoding or "unicode-escape"
 
-    char_ptr = cached_lookup_type("char").pointer()
-
-    length = min(address|(DEFAULT_PAGE_SIZE-1), max_length+1)
+    length = min(address | (DEFAULT_PAGE_SIZE-1), max_length+1)
     try:
-        res = gdb.Value(address).cast(char_ptr).string(encoding=encoding, length=length).strip()
+        res_bytes = bytes(read_memory(address, length))
     except gdb.error:
-        res = bytes(read_memory(address, length)).decode("utf-8")
+        err("Can't read memory at '{}'".format(address))
+        return ""
+    try:
+        with warnings.catch_warnings():
+            # ignore DeprecationWarnings (see #735)
+            warnings.simplefilter("ignore")
+            res = res_bytes.decode(encoding, "strict")
+    except UnicodeDecodeError:
+        # latin-1 as fallback due to its single-byte to glyph mapping
+        res = res_bytes.decode("latin-1", "replace")
 
     res = res.split("\x00", 1)[0]
     ustr = res.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
@@ -3204,7 +3212,9 @@ def get_function_length(sym):
 
 def get_process_maps_linux(proc_map_file):
     """Parse the Linux process `/proc/pid/maps` file."""
-    for line in open_file(proc_map_file, use_cache=False):
+    with open_file(proc_map_file, use_cache=False) as f:
+        file = f.readlines()
+    for line in file:
         line = line.strip()
         addr, perm, off, _, rest = line.split(" ", 4)
         rest = rest.split(" ", 1)
@@ -4525,9 +4535,28 @@ class NamedBreakpoint(gdb.Breakpoint):
 
 
 #
-# Commands
+# Context Panes
 #
 
+def register_external_context_pane(pane_name, display_pane_function, pane_title_function):
+    """
+    Registering function for new GEF Context View.
+    pane_name: a string that has no spaces (used in settings)
+    display_pane_function: a function that uses gef_print() to print strings
+    pane_title_function: a function that returns a string or None, which will be displayed as the title.
+    If None, no title line is displayed.
+
+    Example Usage:
+    def display_pane(): gef_print("Wow, I am a context pane!")
+    def pane_title(): return "example:pane"
+    register_external_context_pane("example_pane", display_pane, pane_title)
+    """
+    __gef__.add_context_pane(pane_name, display_pane_function, pane_title_function)
+
+
+#
+# Commands
+#
 
 def register_external_command(obj):
     """Registering function for new GEF (sub-)command to GDB."""
@@ -4638,6 +4667,19 @@ class GenericCommand(gdb.Command, metaclass=abc.ABCMeta):
         key = self.__get_setting_name(name)
         return key in __config__
 
+    def update_setting(self, name, value, description=None):
+        """Update the value of a setting without destroying the description"""
+        # make sure settings are always associated to the root command (which derives from GenericCommand)
+        if "GenericCommand" not in [x.__name__ for x in self.__class__.__bases__]:
+            return
+        key = self.__get_setting_name(name)
+        __config__[key][0] = value
+        __config__[key][1] = type(value)
+        if description:
+            __config__[key][3] = description
+        get_gef_setting.cache_clear()
+        return
+
     def add_setting(self, name, value, description=""):
         # make sure settings are always associated to the root command (which derives from GenericCommand)
         if "GenericCommand" not in [x.__name__ for x in self.__class__.__bases__]:
@@ -4691,7 +4733,8 @@ class VersionCommand(GenericCommand):
     def do_invoke(self, argv):
         gef_fpath = os.path.abspath(os.path.expanduser(inspect.stack()[0][1]))
         gef_dir = os.path.dirname(gef_fpath)
-        gef_hash = hashlib.sha1(open(gef_fpath, "rb").read()).hexdigest()
+        with open(gef_fpath, "rb") as f:
+            gef_hash = hashlib.sha1(f.read()).hexdigest()
 
         if os.access("{}/.git".format(gef_dir), os.X_OK):
             ver = subprocess.check_output("git log --format='%H' -n 1 HEAD", cwd=gef_dir, shell=True).decode("utf8").strip()
@@ -5106,13 +5149,16 @@ class ProcessStatusCommand(GenericCommand):
 
     def get_state_of(self, pid):
         res = {}
-        for line in open("/proc/{}/status".format(pid), "r"):
+        with open("/proc/{}/status".format(pid), "r") as f:
+            file = f.readlines()
+        for line in file:
             key, value = line.split(":", 1)
             res[key.strip()] = value.strip()
         return res
 
     def get_cmdline_of(self, pid):
-        return open("/proc/{}/cmdline".format(pid), "r").read().replace("\x00", "\x20").strip()
+        with open("/proc/{}/cmdline".format(pid), "r") as f:
+            return f.read().replace("\x00", "\x20").strip()
 
     def get_process_path_of(self, pid):
         return os.readlink("/proc/{}/exe".format(pid))
@@ -5218,9 +5264,11 @@ class ProcessStatusCommand(GenericCommand):
             gef_print("\tNo open connections")
             return
 
-        entries = {}
-        entries["TCP"] = [x.split() for x in open("/proc/{:d}/net/tcp".format(pid), "r").readlines()[1:]]
-        entries["UDP"]= [x.split() for x in open("/proc/{:d}/net/udp".format(pid), "r").readlines()[1:]]
+        entries = dict()
+        with open("/proc/{:d}/net/tcp".format(pid), "r") as tcp:
+            entries["TCP"] = [x.split() for x in tcp.readlines()[1:]]
+        with open("/proc/{:d}/net/udp".format(pid), "r") as udp:
+            entries["UDP"] = [x.split() for x in udp.readlines()[1:]]
 
         for proto in entries:
             for entry in entries[proto]:
@@ -6782,8 +6830,8 @@ class StubCommand(GenericCommand):
     function to be called and disrupt your runtime flow (ex. fork)."""
 
     _cmdline_ = "stub"
-    _syntax_  = """{:s} [--retval RETVAL] [LOCATION]
-\tLOCATION\taddress/symbol to stub out
+    _syntax_  = """{:s} [--retval RETVAL] [address]
+\taddress\taddress/symbol to stub out
 \t--retval RETVAL\tSet the return value""".format(_cmdline_)
     _example_ = "{:s} --retval 0 fork".format(_cmdline_)
 
@@ -6792,7 +6840,7 @@ class StubCommand(GenericCommand):
         return
 
     @only_if_gdb_running
-    @parse_arguments({"address": ""}, {"--retval": 0})
+    @parse_arguments({"address": ""}, {("-r", "--retval"): 0})
     def do_invoke(self, argv, *args, **kwargs):
         args = kwargs["arguments"]
         loc = args.address if args.address else "*{:#x}".format(current_arch.pc)
@@ -7412,29 +7460,30 @@ class SolveKernelSymbolCommand(GenericCommand):
     _syntax_  = "{:s} SymbolToSearch".format(_cmdline_)
     _example_ = "{:s} prepare_creds".format(_cmdline_)
 
-    def do_invoke(self, argv):
-        if len(argv) != 1:
+    @parse_arguments({"symbol": ""}, {})
+    def do_invoke(self, *args, **kwargs):
+        def hex_to_int(num):
+            try:
+                return int(num, 16)
+            except ValueError:
+                return 0
+        args = kwargs["arguments"]
+        if not args.symbol:
             self.usage()
             return
-
-        found = False
-        sym = argv[0]
+        sym = args.symbol
         with open("/proc/kallsyms", "r") as f:
-            for line in f:
-                try:
-                    symaddr, symtype, symname = line.strip().split(" ", 3)
-                    symaddr = int(symaddr, 16)
-                    if symname == sym:
-                        ok("Found matching symbol for '{:s}' at {:#x} (type={:s})".format(sym, symaddr, symtype))
-                        found = True
-                    if sym in symname:
-                        warn("Found partial match for '{:s}' at {:#x} (type={:s}): {:s}".format(sym, symaddr, symtype, symname))
-                        found = True
-                except ValueError:
-                    pass
-
-        if not found:
+            syms = [line.strip().split(" ", 2) for line in f]
+        matches = [(hex_to_int(addr), sym_t, " ".join(name.split())) for addr, sym_t, name in syms if sym in name]
+        for addr, sym_t, name in matches:
+            if sym == name.split()[0]:
+                ok("Found matching symbol for '{:s}' at {:#x} (type={:s})".format(name, addr, sym_t))
+            else:
+                warn("Found partial match for '{:s}' at {:#x} (type={:s}): {:s}".format(sym, addr, sym_t, name))
+        if not matches:
             err("No match for '{:s}'".format(sym))
+        elif matches[0][0] == 0:
+            err("Check that you have the correct permissions to view kernel symbol addresses")
         return
 
 
@@ -8236,16 +8285,16 @@ class ContextCommand(GenericCommand):
             self.add_setting("use_capstone", False, "Use capstone as disassembler in the code pane (instead of GDB)")
 
         self.layout_mapping = {
-            "legend":  self.show_legend,
-            "regs":  self.context_regs,
-            "stack": self.context_stack,
-            "code": self.context_code,
-            "args": self.context_args,
-            "memory": self.context_memory,
-            "source": self.context_source,
-            "trace": self.context_trace,
-            "threads": self.context_threads,
-            "extra": self.context_additional_information,
+            "legend": (self.show_legend, None),
+            "regs": (self.context_regs, None),
+            "stack": (self.context_stack, None),
+            "code": (self.context_code, None),
+            "args": (self.context_args, None),
+            "memory": (self.context_memory, None),
+            "source": (self.context_source, None),
+            "trace": (self.context_trace, None),
+            "threads": (self.context_threads, None),
+            "extra": (self.context_additional_information, None),
         }
         return
 
@@ -8299,7 +8348,10 @@ class ContextCommand(GenericCommand):
                 continue
 
             try:
-                self.layout_mapping[section]()
+                display_pane_function, pane_title_function = self.layout_mapping[section]
+                if pane_title_function:
+                    self.context_title(pane_title_function())
+                display_pane_function()
             except gdb.MemoryError as e:
                 # a MemoryError will happen when $pc is corrupted (invalid address)
                 err(str(e))
@@ -8314,9 +8366,14 @@ class ContextCommand(GenericCommand):
         return
 
     def context_title(self, m):
+        # allow for not displaying a title line
+        if m is None:
+            return
+
         line_color = get_gef_setting("theme.context_title_line")
         msg_color = get_gef_setting("theme.context_title_message")
 
+        # print an empty line in case of ""
         if not m:
             gef_print(Color.colorify(HORIZONTAL_LINE * self.tty_columns, line_color))
             return
@@ -8415,7 +8472,7 @@ class ContextCommand(GenericCommand):
                 mem = read_memory(sp, 0x10 * nb_lines)
                 gef_print(hexdump(mem, base=sp))
             else:
-                gdb.execute("dereference {:#x} l{:d}".format(sp, nb_lines))
+                gdb.execute("dereference -l {:d} {:#x}".format(nb_lines, sp))
 
         except gdb.MemoryError:
             err("Cannot read memory from $SP (corrupted stack pointer?)")
@@ -8862,12 +8919,12 @@ class ContextCommand(GenericCommand):
             sz, fmt = opt[0:2]
             self.context_title("memory:{:#x}".format(address))
             if fmt == "pointers":
-                gdb.execute("dereference 0x{address:x} L{size:d}".format(
+                gdb.execute("dereference -l {size:d} {address:#x}".format(
                     address=address,
                     size=sz,
                 ))
             else:
-                gdb.execute("hexdump {fmt:s} 0x{address:x} -s {size:d}".format(
+                gdb.execute("hexdump {fmt:s} -s {size:d} {address:#x}".format(
                     address=address,
                     size=sz,
                     fmt=fmt,
@@ -9334,9 +9391,9 @@ class DereferenceCommand(GenericCommand):
     command."""
 
     _cmdline_ = "dereference"
-    _syntax_  = "{:s} [LOCATION] [[l]NB] [rLOCATION]".format(_cmdline_)
+    _syntax_  = "{:s} [-h] [--length LENGTH] [--reference REFERENCE] [address]".format(_cmdline_)
     _aliases_ = ["telescope", ]
-    _example_ = "{:s} $sp l20 r$sp+0x10".format(_cmdline_)
+    _example_ = "{:s} --length 20 --reference $sp+0x10 $sp".format(_cmdline_)
 
     def __init__(self):
         super().__init__(complete=gdb.COMPLETE_LOCATION)
@@ -9375,40 +9432,21 @@ class DereferenceCommand(GenericCommand):
         return l
 
     @only_if_gdb_running
-    def do_invoke(self, argv):
-        target = "$sp"
-        reference = ""
-        nb = 10
+    @parse_arguments({"address": "$sp"}, {("-r", "--reference"): "", ("-l", "--length"): 10})
+    def do_invoke(self, *args, **kwargs):
+        args = kwargs["arguments"]
+        nb = args.length
 
-        for arg in argv:
-            if arg.isdigit():
-                nb = int(arg)
-            elif arg[0] in ("l", "L") and arg[1:].isdigit():
-                nb = int(arg[1:])
-            elif arg[0] in ("r", "R") and len(arg) > 1:
-                reference = arg[1:]
-            else:
-                target = arg
+        target = args.address
+        target_addr = parse_address(target)
 
-        if reference == "":
-            reference = target
+        reference = args.reference or target
+        ref_addr = parse_address(reference)
 
-        addr = safe_parse_and_eval(target)
-        if addr is None:
-            err("Invalid address")
+        if process_lookup_address(target_addr) is None:
+            err("Unmapped address: '{}'".format(target))
             return
 
-        addr = int(addr)
-        if process_lookup_address(addr) is None:
-            err("Unmapped address")
-            return
-
-        ref_addr = safe_parse_and_eval(reference)
-        if ref_addr is None:
-            err("Invalid address: '{}'".format(reference))
-            return
-
-        ref_addr = int(ref_addr)
         if process_lookup_address(ref_addr) is None:
             err("Unmapped address: '{}'".format(reference))
             return
@@ -9422,7 +9460,7 @@ class DereferenceCommand(GenericCommand):
             to_insnum = nb * (self.repeat_count + 1)
             insnum_step = 1
 
-        start_address = align_address(addr)
+        start_address = align_address(target_addr)
         base_offset = start_address - align_address(ref_addr)
 
         for i in range(from_insnum, to_insnum, insnum_step):
@@ -9831,17 +9869,16 @@ class TraceRunCommand(GenericCommand):
 
 @register_command
 class PatternCommand(GenericCommand):
-    """This command will create or search a De Bruijn cyclic pattern to facilitate
-    determining the offset in memory. The algorithm used is the same as the one
-    used by pwntools, and can therefore be used in conjunction."""
+    """Generate or Search a De Bruijn Sequence of unique substrings of length N
+    and a total length of LENGTH. The default value of N is set to match the
+    currently loaded architecture."""
 
     _cmdline_ = "pattern"
     _syntax_  = "{:s} (create|search) ARGS".format(_cmdline_)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self):
         super().__init__(prefix=True)
         self.add_setting("length", 1024, "Default length of a cyclic buffer to generate")
-        self.add_setting("period", 4, "Default period")
         return
 
     def do_invoke(self, argv):
@@ -9851,21 +9888,21 @@ class PatternCommand(GenericCommand):
 
 @register_command
 class PatternCreateCommand(GenericCommand):
-    """Generate a de Bruijn cyclic pattern. It will generate a pattern long of SIZE,
-    incrementally varying of one byte at each generation. The pattern rotation period
-    is by default set to 4 for compatibility with pwntools, but can be adjusted."""
+    """Generate a De Bruijn Sequence of unique substrings of length N and a
+    total length of LENGTH. The default value of N is set to match the currently
+    loaded architecture."""
 
     _cmdline_ = "pattern create"
-    _syntax_  = "{:s} [SIZE]".format(_cmdline_)
+    _syntax_  = "{:s} [-h] [-n N] [length]".format(_cmdline_)
     _example_ = "{:s} 4096".format(_cmdline_)
 
-    @parse_arguments({"length": 0}, {"--period": 0})
-    def do_invoke(self, argv, *args, **kwargs):
+    @parse_arguments({"length": 0}, {("-n", "--n"): 0})
+    def do_invoke(self, *args, **kwargs):
         args = kwargs["arguments"]
         length = args.length or get_gef_setting("pattern.length")
-        period = args.period or get_gef_setting("pattern.period")
-        info("Generating a pattern of {:d} bytes (n={:d})".format(length, period))
-        pattern_str = gef_pystring(generate_cyclic_pattern(length, period))
+        n = args.n or current_arch.ptrsize
+        info("Generating a pattern of {:d} bytes (n={:d})".format(length, n))
+        pattern_str = gef_pystring(generate_cyclic_pattern(length, n))
         gef_print(pattern_str)
         ok("Saved as '{:s}'".format(gef_convenience(pattern_str)))
         return
@@ -9873,22 +9910,24 @@ class PatternCreateCommand(GenericCommand):
 
 @register_command
 class PatternSearchCommand(GenericCommand):
-    """Search for the cyclic de Bruijn pattern generated by the `pattern create` command. The
-    PATTERN argument can be a GDB symbol (such as a register name) or an hexadecimal value."""
+    """Search a De Bruijn Sequence of unique substrings of length N and a
+    maximum total length of MAX_LENGTH. The default value of N is set to match
+    the currently loaded architecture. The PATTERN argument can be a GDB symbol
+    (such as a register name), a string or a hexadecimal value"""
 
     _cmdline_ = "pattern search"
-    _syntax_  = "{:s} PATTERN [SIZE]".format(_cmdline_)
+    _syntax_  = "{:s} [-h] [-n N] [--max-length MAX_LENGTH] [pattern]".format(_cmdline_)
     _example_ = "\n{0:s} $pc\n{0:s} 0x61616164\n{0:s} aaab".format(_cmdline_)
-    _aliases_ = ["pattern offset",]
+    _aliases_ = ["pattern offset"]
 
     @only_if_gdb_running
-    @parse_arguments({"pattern": ""}, {"--period": 0, "--length": 0})
-    def do_invoke(self, argv, *args, **kwargs):
+    @parse_arguments({"pattern": ""}, {("-n", "--n"): 0, ("-l", "--max-length"): 0})
+    def do_invoke(self, *args, **kwargs):
         args = kwargs["arguments"]
-        length = args.length or get_gef_setting("pattern.length")
-        period = args.period or get_gef_setting("pattern.period")
+        max_length = args.max_length or get_gef_setting("pattern.length")
+        n = args.n or current_arch.ptrsize
         info("Searching for '{:s}'".format(args.pattern))
-        self.search(args.pattern, length, period)
+        self.search(args.pattern, max_length, n)
         return
 
     def search(self, pattern, size, period):
@@ -9902,14 +9941,13 @@ class PatternSearchCommand(GenericCommand):
             # 1-bis. try to dereference
             if dereferenced_value:
                 addr = int(dereferenced_value)
-
-            if current_arch.ptrsize == 4:
-                pattern_be = struct.pack(">I", addr)
-                pattern_le = struct.pack("<I", addr)
-            else:
-                pattern_be = struct.pack(">Q", addr)
-                pattern_le = struct.pack("<Q", addr)
-
+            struct_packsize = {
+                2: "H",
+                4: "I",
+                8: "Q",
+            }
+            pattern_be = struct.pack(">{}".format(struct_packsize[current_arch.ptrsize]), addr)
+            pattern_le = struct.pack("<{}".format(struct_packsize[current_arch.ptrsize]), addr)
         else:
             # 2. assume it's a plain string
             pattern_be = gef_pybytes(pattern)
@@ -10422,6 +10460,8 @@ def get_zone_base_address(name):
 class GenericFunction(gdb.Function, metaclass=abc.ABCMeta):
     """This is an abstract class for invoking convenience functions, should not be instantiated."""
 
+    _example_ = ""
+
     @abc.abstractproperty
     def _function_(self): pass
     @property
@@ -10481,8 +10521,11 @@ class HeapBaseFunction(GenericFunction):
 
 @register_function
 class SectionBaseFunction(GenericFunction):
-    """Return the matching section's base address plus an optional offset."""
+    """Return the matching file's base address plus an optional offset.
+    Defaults to current file. Note that quotes need to be escaped"""
     _function_ = "_base"
+    _syntax_   = "$_base([filepath])"
+    _example_  = "p $_base(\\\"/usr/lib/ld-2.33.so\\\")"
 
     def do_invoke(self, args):
         try:
@@ -10505,6 +10548,7 @@ class SectionBaseFunction(GenericFunction):
 class BssBaseFunction(GenericFunction):
     """Return the current bss base address plus the given offset."""
     _function_ = "_bss"
+    _example_ = "deref $_bss(0x20)"
 
     def do_invoke(self, args):
         return self.arg_to_long(args, 0) + get_zone_base_address(".bss")
@@ -10544,6 +10588,10 @@ class GefFunctionsCommand(GenericCommand):
         doc = "\n                         ".join(doc.split("\n"))
         syntax = getattr(function, "_syntax_", "").lstrip()
         msg = "{syntax:<25s} -- {help:s}".format(syntax=syntax, help=Color.greenify(doc))
+        example = getattr(function, "_example_", "").strip()
+        if example:
+            msg += "\n {padding:27s} example: {example:s}".format(
+                padding="", example=Color.yellowify(example))
         self.docs.append(msg)
         return
 
@@ -10551,8 +10599,7 @@ class GefFunctionsCommand(GenericCommand):
         self.dont_repeat()
         gef_print(titlify("GEF - Convenience Functions"))
         gef_print("These functions can be used as arguments to other "
-                  "commands to dynamically calculate values, eg: {:s}\n"
-                  .format(Color.colorify("deref $_heap(0x20)", "yellow")))
+                  "commands to dynamically calculate values\n")
         gef_print(self.__doc__)
         return
 
@@ -10649,6 +10696,21 @@ class GefCommand(gdb.Command):
         self.dont_repeat()
         gdb.execute("gef help")
         return
+
+    def add_context_pane(self, pane_name, display_pane_function, pane_title_function):
+        """Add a new context pane to ContextCommand."""
+        for _, _, class_obj in self.loaded_commands:
+            if isinstance(class_obj, ContextCommand):
+                context_obj = class_obj
+                break
+
+        # assure users can toggle the new context
+        corrected_settings_name = pane_name.replace(" ", "_")
+        layout_settings = context_obj.get_setting("layout")
+        context_obj.update_setting("layout", "{} {}".format(layout_settings, corrected_settings_name))
+
+        # overload the printing of pane title
+        context_obj.layout_mapping[corrected_settings_name] = (display_pane_function, pane_title_function)
 
     def load(self, initial=False):
         """Load all the commands and functions defined by GEF into GDB."""
