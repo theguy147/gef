@@ -10,6 +10,7 @@ import platform
 import re
 import subprocess
 import tempfile
+import time
 import unittest
 import warnings
 from typing import Dict, Iterable, List, Optional, Union
@@ -28,6 +29,7 @@ GEF_DEFAULT_PROMPT = "gef➤  "
 GEF_DEFAULT_TEMPDIR = "/tmp/gef"
 GEF_PATH = pathlib.Path(os.getenv("GEF_PATH", "gef.py"))
 STRIP_ANSI_DEFAULT = True
+GDBSERVER_DEFAULT_HOST = "localhost"
 GDBSERVER_DEFAULT_PORT = 1234
 
 CommandType = Union[str, Iterable[str]]
@@ -230,6 +232,7 @@ def _target(name: str, extension: str = ".out") -> pathlib.Path:
 
 
 def start_gdbserver(exe: Union[str, pathlib.Path] = _target("default"),
+                    host: str = GDBSERVER_DEFAULT_HOST,
                     port: int = GDBSERVER_DEFAULT_PORT) -> subprocess.Popen:
     """Start a gdbserver on the target binary.
 
@@ -240,7 +243,7 @@ def start_gdbserver(exe: Union[str, pathlib.Path] = _target("default"),
     Returns:
         subprocess.Popen: a Popen object for the gdbserver process.
     """
-    return subprocess.Popen(["gdbserver", f":{port}", exe],
+    return subprocess.Popen(["gdbserver", f"{host}:{port}", exe],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -259,9 +262,11 @@ def stop_gdbserver(gdbserver: subprocess.Popen) -> None:
 @contextlib.contextmanager
 def gdbserver_session(*args, **kwargs):
     exe = kwargs.get("exe", "") or _target("default")
-    port = kwargs.get("port", 0) or GDBSERVER_DEFAULT_PORT
-    sess = start_gdbserver(exe, port)
+    host = kwargs.get("host", GDBSERVER_DEFAULT_HOST)
+    port = kwargs.get("port", GDBSERVER_DEFAULT_PORT)
+    sess = start_gdbserver(exe, host, port)
     try:
+        time.sleep(1) # forced delay to allow gdbserver to start listening
         yield sess
     finally:
         stop_gdbserver(sess)

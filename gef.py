@@ -234,7 +234,7 @@ def highlight_text(text: str) -> str:
 def gef_print(*args: str, end="\n", sep=" ", **kwargs: Any) -> None:
     """Wrapper around print(), using string buffering feature."""
     parts = [highlight_text(a) for a in args]
-    if gef.ui.stream_buffer and not is_debug():
+    if buffer_output() and gef.ui.stream_buffer and not is_debug():
         gef.ui.stream_buffer.write(sep.join(parts) + end)
         return
 
@@ -627,21 +627,30 @@ class Permission(enum.Flag):
         perm_str += "x" if self & Permission.EXECUTE else "-"
         return perm_str
 
-    @staticmethod
-    def from_info_sections(*args: str) -> "Permission":
-        perm = Permission(0)
+    @classmethod
+    def from_info_sections(cls, *args: str) -> "Permission":
+        perm = cls(0)
         for arg in args:
             if "READONLY" in arg: perm |= Permission.READ
             if "DATA" in arg: perm |= Permission.WRITE
             if "CODE" in arg: perm |= Permission.EXECUTE
         return perm
 
-    @staticmethod
-    def from_process_maps(perm_str: str) -> "Permission":
-        perm = Permission(0)
+    @classmethod
+    def from_process_maps(cls, perm_str: str) -> "Permission":
+        perm = cls(0)
         if perm_str[0] == "r": perm |= Permission.READ
         if perm_str[1] == "w": perm |= Permission.WRITE
         if perm_str[2] == "x": perm |= Permission.EXECUTE
+        return perm
+
+    @classmethod
+    def from_info_mem(cls, perm_str: str) -> "Permission":
+        perm = cls(0)
+        # perm_str[0] shows if this is a user page, which
+        # we don't track
+        if perm_str[1] == "r": perm |= Permission.READ
+        if perm_str[2] == "w": perm |= Permission.WRITE
         return perm
 
 
@@ -1298,7 +1307,7 @@ class GlibcArena:
             # https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L1719
             fields += [
                 ("attached_threads", pointer)
-            ]            
+            ]
         fields += [
             ("system_mem", pointer),
             ("max_system_mem", pointer),
@@ -1586,7 +1595,7 @@ class GlibcChunk:
 
     def get_next_chunk_addr(self) -> int:
         return self.data_address + self.size
-    
+
     def has_p_bit(self) -> bool:
         return bool(self.flags & GlibcChunk.ChunkFlags.PREV_INUSE)
 
@@ -1683,7 +1692,7 @@ class GlibcFastChunk(GlibcChunk):
         return gef.memory.read_integer(pointer) ^ (pointer >> 12)
 
 class GlibcTcacheChunk(GlibcFastChunk):
-    
+
     pass
 
 
@@ -1880,6 +1889,11 @@ def hexdump(source: ByteString, length: int = 0x10, separator: str = ".", show_r
 def is_debug() -> bool:
     """Check if debug mode is enabled."""
     return gef.config["gef.debug"] is True
+
+
+def buffer_output() -> bool:
+    """Check if output should be buffered until command completion."""
+    return gef.config["gef.buffer"] is True
 
 
 def hide_context() -> bool:
@@ -2258,6 +2272,9 @@ class Architecture(ArchitectureBase):
         raise NotImplementedError
 
     def get_ra(self, insn: Instruction, frame: "gdb.Frame") -> Optional[int]:
+        raise NotImplementedError
+
+    def canary_address(self) -> int:
         raise NotImplementedError
 
     @classmethod
@@ -2920,6 +2937,8 @@ class X86_64(X86):
         ]
         return "; ".join(insns)
 
+    def canary_address(self) -> int:
+        return self.register("fs_base") + 0x28
 
 class PowerPC(Architecture):
     aliases = ("PowerPC", Elf.Abi.POWERPC, "PPC")
@@ -3333,15 +3352,15 @@ def get_os() -> str:
 def is_qemu() -> bool:
     if not is_remote_debug():
         return False
-    response = gdb.execute('maintenance packet Qqemu.sstepbits', to_string=True, from_tty=False)
-    return 'ENABLE=' in response
+    response = gdb.execute("maintenance packet Qqemu.sstepbits", to_string=True, from_tty=False)
+    return "ENABLE=" in response
 
 
 @lru_cache()
 def is_qemu_usermode() -> bool:
     if not is_qemu():
         return False
-    response = gdb.execute('maintenance packet QOffsets', to_string=True, from_tty=False)
+    response = gdb.execute("maintenance packet qOffsets", to_string=True, from_tty=False)
     return "Text=" in response
 
 
@@ -3349,8 +3368,8 @@ def is_qemu_usermode() -> bool:
 def is_qemu_system() -> bool:
     if not is_qemu():
         return False
-    response = gdb.execute('maintenance packet QOffsets', to_string=True, from_tty=False)
-    return 'received: ""' in response
+    response = gdb.execute("maintenance packet qOffsets", to_string=True, from_tty=False)
+    return "received: \"\"" in response
 
 
 def get_filepath() -> Optional[str]:
@@ -3490,8 +3509,13 @@ def hook_stop_handler(_: "gdb.StopEvent") -> None:
 def new_objfile_handler(evt: Optional["gdb.NewObjFileEvent"]) -> None:
     """GDB event handler for new object file cases."""
     reset_all_caches()
+    path = evt.new_objfile.filename if evt else gdb.current_progspace().filename
     try:
-        target = pathlib.Path( evt.new_objfile.filename if evt else gdb.current_progspace().filename)
+        if gef.session.root and path.startswith("target:"):
+            # If the process is in a container, replace the "target:" prefix
+            # with the actual root directory of the process.
+            path = path.replace("target:", str(gef.session.root), 1)
+        target = pathlib.Path(path)
         FileFormatClasses = list(filter(lambda fmtcls: fmtcls.is_valid(target), __registered_file_formats__))
         GuessedFileFormatClass : Type[FileFormat] = FileFormatClasses.pop() if len(FileFormatClasses) else Elf
         binary = GuessedFileFormatClass(target)
@@ -3501,7 +3525,11 @@ def new_objfile_handler(evt: Optional["gdb.NewObjFileEvent"]) -> None:
         else:
             gef.session.modules.append(binary)
     except FileNotFoundError as fne:
-        warn(f"Failed to find objfile or not a valid file format: {str(fne)}")
+        # Linux automatically maps the vDSO into our process, and GDB
+        # will give us the string 'system-supplied DSO' as a path.
+        # This is normal, so we shouldn't warn the user about it
+        if "system-supplied DSO" not in path:
+            warn(f"Failed to find objfile or not a valid file format: {str(fne)}")
     except RuntimeError as re:
         warn(f"Not a valid file format: {str(re)}")
     return
@@ -3519,6 +3547,7 @@ def exit_handler(_: "gdb.ExitedEvent") -> None:
         gef.session.remote.close()
         del gef.session.remote
         gef.session.remote = None
+        gef.session.remote_initializing = False
     return
 
 
@@ -3612,6 +3641,7 @@ def reset_architecture(arch: Optional[str] = None) -> None:
             gef.arch = arches[arch]()
         except KeyError:
             raise OSError(f"Specified arch {arch.upper()} is not supported")
+        return
 
     gdb_arch = get_arch()
 
@@ -3731,7 +3761,7 @@ def is_in_x86_kernel(address: int) -> bool:
 
 def is_remote_debug() -> bool:
     """"Return True is the current debugging session is running through GDB remote session."""
-    return gef.session.remote is not None
+    return gef.session.remote_initializing or gef.session.remote is not None
 
 
 def de_bruijn(alphabet: bytes, n: int) -> Generator[str, None, None]:
@@ -5939,7 +5969,12 @@ class RemoteCommand(GenericCommand):
             return
 
         # try to establish the remote session, throw on error
+        # Set `.remote_initializing` to True here - `GefRemoteSessionManager` invokes code which
+        # calls `is_remote_debug` which checks if `remote_initializing` is True or `.remote` is None
+        # This prevents some spurious errors being thrown during startup
+        gef.session.remote_initializing = True
         gef.session.remote = GefRemoteSessionManager(args.host, args.port, args.pid, qemu_binary)
+        gef.session.remote_initializing = False
         reset_all_caches()
         gdb.execute("context")
         return
@@ -6774,7 +6809,7 @@ class ShellcodeGetCommand(GenericCommand):
     _aliases_ = ["sc-get",]
 
     api_base = "http://shell-storm.org"
-    get_url = f"{api_base}/shellcode/files/shellcode-{{:d}}.php"
+    get_url = f"{api_base}/shellcode/files/shellcode-{{:d}}.html"
 
     def do_invoke(self, argv: List[str]) -> None:
         if len(argv) != 1:
@@ -6798,13 +6833,11 @@ class ShellcodeGetCommand(GenericCommand):
             return
 
         ok("Downloaded, written to disk...")
-        tempdir = gef.config["gef.tempdir"]
-        fd, fname = tempfile.mkstemp(suffix=".txt", prefix="sc-", text=True, dir=tempdir)
-        shellcode = res.splitlines()[7:-11]
-        shellcode = b"\n".join(shellcode).replace(b"&quot;", b'"')
-        os.write(fd, shellcode)
-        os.close(fd)
-        ok(f"Shellcode written to '{fname}'")
+        with tempfile.NamedTemporaryFile(prefix="sc-", suffix=".txt", mode='w+b', delete=False, dir=gef.config["gef.tempdir"]) as fd:
+            shellcode = res.split(b"<pre>")[1].split(b"</pre>")[0]
+            shellcode = shellcode.replace(b"&quot;", b'"')
+            fd.write(shellcode)
+            ok(f"Shellcode written to '{fd.name}'")
         return
 
 
@@ -9339,6 +9372,7 @@ class GefCommand(gdb.Command):
         gef.config["gef.disable_color"] = GefSetting(False, bool, "Disable all colors in GEF")
         gef.config["gef.tempdir"] = GefSetting(GEF_TEMP_DIR, str, "Directory to use for temporary/cache content")
         gef.config["gef.show_deprecation_warnings"] = GefSetting(True, bool, "Toggle the display of the `deprecated` warnings")
+        gef.config["gef.buffer"] = GefSetting(True, bool, "Internally buffer command output until completion")
 
         self.commands : Dict[str, GenericCommand] = collections.OrderedDict()
         self.functions : Dict[str, GenericFunction] = collections.OrderedDict()
@@ -10180,6 +10214,12 @@ class GefMemoryManager(GefManager):
     def __parse_maps(self) -> List[Section]:
         """Return the mapped memory sections"""
         try:
+            if is_qemu_system():
+                return list(self.__parse_info_mem())
+        except gdb.error:
+            # Target may not support this command
+            pass
+        try:
             return list(self.__parse_procfs_maps())
         except FileNotFoundError:
             return list(self.__parse_gdb_info_sections())
@@ -10242,6 +10282,27 @@ class GefMemoryManager(GefManager):
             except ValueError:
                 continue
         return
+
+    def __parse_info_mem(self) -> Generator[Section, None, None]:
+        """Get the memory mapping from GDB's command `monitor info mem`"""
+        for line in StringIO(gdb.execute("monitor info mem", to_string=True)):
+            if not line:
+                break
+            try:
+                ranges, off, perms = line.split()
+                off = int(off, 16)
+                start, end = [int(s, 16) for s in ranges.split("-")]
+            except ValueError as e:
+                continue
+
+            perm = Permission.from_info_mem(perms)
+            yield Section(
+                page_start=start,
+                page_end=end,
+                offset=off,
+                permission=perm,
+                inode="",
+            )
 
 
 class GefHeapManager(GefManager):
@@ -10421,6 +10482,7 @@ class GefSessionManager(GefManager):
     def __init__(self) -> None:
         self.reset_caches()
         self.remote: Optional["GefRemoteSessionManager"] = None
+        self.remote_initializing: bool = False
         self.qemu_mode: bool = False
         self.convenience_vars_index: int = 0
         self.heap_allocated_chunks: List[Tuple[int, int]] = []
@@ -10442,8 +10504,8 @@ class GefSessionManager(GefManager):
         self._os = None
         self._pid = None
         self._file = None
-        self._canary = None
         self._maps: Optional[pathlib.Path] = None
+        self._root: Optional[pathlib.Path] = None
         return
 
     def __str__(self) -> str:
@@ -10453,7 +10515,8 @@ class GefSessionManager(GefManager):
     def auxiliary_vector(self) -> Optional[Dict[str, int]]:
         if not is_alive():
             return None
-
+        if is_qemu_system():
+            return None
         if not self._auxiliary_vector:
             auxiliary_vector = {}
             auxv_info = gdb.execute("info auxv", to_string=True)
@@ -10515,15 +10578,30 @@ class GefSessionManager(GefManager):
 
     @property
     def canary(self) -> Optional[Tuple[int, int]]:
-        """Returns a tuple of the canary address and value, read from the auxiliary vector."""
+        """Return a tuple of the canary address and value, read from the canonical
+        location if supported by the architecture. Otherwise, read from the auxiliary
+        vector."""
+        try:
+            canary_location = gef.arch.canary_address()
+            canary = gef.memory.read_integer(canary_location)
+        except NotImplementedError:
+            # Fall back to `AT_RANDOM`, which is the original source
+            # of the canary value but not the canonical location
+            return self.original_canary
+        return canary, canary_location
+
+    @property
+    def original_canary(self) -> Optional[Tuple[int, int]]:
+        """Return a tuple of the initial canary address and value, read from the
+        auxiliary vector."""
         auxval = self.auxiliary_vector
         if not auxval:
             return None
         canary_location = auxval["AT_RANDOM"]
         canary = gef.memory.read_integer(canary_location)
         canary &= ~0xFF
-        self._canary = (canary, canary_location)
-        return self._canary
+        return canary, canary_location
+
 
     @property
     def maps(self) -> Optional[pathlib.Path]:
@@ -10537,6 +10615,14 @@ class GefSessionManager(GefManager):
                 self._maps = pathlib.Path(f"/proc/{self.pid}/maps")
         return self._maps
 
+    @property
+    def root(self) -> Optional[pathlib.Path]:
+        """Returns the path to the process's root directory."""
+        if not is_alive():
+            return None
+        if not self._root:
+            self._root = pathlib.Path(f"/proc/{self.pid}/root")
+        return self._root
 
 class GefRemoteSessionManager(GefSessionManager):
     """Class for managing remote sessions with GEF. It will create a temporary environment
@@ -10863,7 +10949,7 @@ if __name__ == "__main__":
         "set pagination off",
         "set print elements 0",
         "set history save on",
-        "set history filename ~/.gdb_history",
+        f"set history filename {os.getenv('GDBHISTFILE', '~/.gdb_history')}",
         "set output-radix 0x10",
         "set print pretty on",
         "set disassembly-flavor intel",
