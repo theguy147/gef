@@ -1698,24 +1698,19 @@ class GlibcFastChunk(GlibcChunk):
 
     @property
     def fd(self) -> int:
-        assert(gef and gef.libc.version)
-        if gef.libc.version < (2, 32):
-            return self._chunk.fd
-        return self.reveal_ptr(self.data_address)
+        return self.reveal_ptr(self.data_address, self._chunk.fd)
 
-    def protect_ptr(self, pos: int, pointer: int) -> int:
+    def protect_ptr(self, pointer_addr: int, pointer: int) -> int:
         """https://elixir.bootlin.com/glibc/glibc-2.32/source/malloc/malloc.c#L339"""
-        assert(gef and gef.libc.version)
-        if gef.libc.version < (2, 32):
+        if not gef.heap.uses_safe_linking():
             return pointer
-        return (pos >> 12) ^ pointer
+        return (pointer_addr >> 12) ^ pointer
 
-    def reveal_ptr(self, pointer: int) -> int:
+    def reveal_ptr(self, pointer_addr: int, pointer: int) -> int:
         """https://elixir.bootlin.com/glibc/glibc-2.32/source/malloc/malloc.c#L341"""
-        assert(gef and gef.libc.version)
-        if gef.libc.version < (2, 32):
+        if not gef.heap.uses_safe_linking():
             return pointer
-        return gef.memory.read_integer(pointer) ^ (pointer >> 12)
+        return pointer ^ (pointer_addr >> 12)
 
 class GlibcTcacheChunk(GlibcFastChunk):
 
@@ -9398,6 +9393,7 @@ class GefCommand(gdb.Command):
         gef.config["gef.buffer"] = GefSetting(True, bool, "Internally buffer command output until completion")
         gef.config["gef.bruteforce_main_arena"] = GefSetting(False, bool, "Allow bruteforcing main_arena symbol if everything else fails")
         gef.config["gef.main_arena_offset"] = GefSetting("", str, "Offset from libc base address to main_arena symbol (int or hex). Set to empty string to disable.")
+        gef.config["gef.use_safe_linking"] = GefSetting(None, bool, "Assume that safe linking is used")
 
         self.commands : Dict[str, GenericCommand] = collections.OrderedDict()
         self.functions : Dict[str, GenericFunction] = collections.OrderedDict()
@@ -10500,6 +10496,12 @@ class GefHeapManager(GefManager):
         malloc_alignment = self.malloc_alignment
         ceil = lambda n: int(-1 * n // 1 * -1)
         return malloc_alignment * ceil((address / malloc_alignment))
+
+    @staticmethod
+    def uses_safe_linking() -> bool:
+        if gef.config["use_safe_linking"] is not None:
+            return gef.config["use_safe_linking"]
+        return not (gef.libc and gef.libc.version < (2,32))
 
 
 class GefSetting:
